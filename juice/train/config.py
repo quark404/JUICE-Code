@@ -54,6 +54,15 @@ class TrainConfig:
     img_known_inpaint: bool = False
     img_known_regimes: list[str] = field(default_factory=lambda: ["product", "t2i"])
 
+    # Opt-in robotic VLA workflow. Legacy configs remain unchanged.
+    action_dim: int = 0
+    action_horizon: int = 16
+    action_adapter: str = "continuous"
+    action_hidden_dim: int = 256
+    action_noise_scale: float = 1.0
+    lambda_action: float = 1.0
+    vla_tasks: dict[str, float] = field(default_factory=lambda: {"action_policy": 1.0})
+
     # Optimization
     seed: int = 4242
     batch_size: int = 4096               # global batch = micro_batch_size * grad_accum_steps * GPUs
@@ -77,6 +86,17 @@ class TrainConfig:
     save_keep: int = 3
 
     def __post_init__(self) -> None:
+        if self.action_dim < 0 or self.action_horizon <= 0 or self.action_hidden_dim <= 0:
+            raise ValueError("invalid action dimensions")
+        if self.action_adapter not in ("continuous", "mlp"):
+            raise ValueError("action_adapter must be continuous or mlp")
+        if self.action_noise_scale <= 0 or self.lambda_action < 0:
+            raise ValueError("invalid action objective scales")
+        if self.action_dim:
+            from juice.train.vla import validate_tasks
+            validate_tasks(self.vla_tasks)
+            if self.img_known_inpaint:
+                raise ValueError("VLA uses vla_known masks instead of legacy image inpainting")
         if self.image_space not in IMAGE_SPACES:
             raise ValueError(f"image_space must be one of {sorted(IMAGE_SPACES)}, got {self.image_space!r}")
         if len(self.train_manifests) != len(self.train_manifest_counts):

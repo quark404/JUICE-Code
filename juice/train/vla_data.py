@@ -1,0 +1,86 @@
+"""Frozen-feature training records for the no-State Action baseline.
+
+Manifests contain paths to torch.save dictionaries, one window per file. Only
+weights_only=True deserialization is used. Encoders run independently per variable
+group upstream; never encode instruction + target plan as a single T5 sequence.
+"""
+from pathlib import Path
+import random
+import torch
+from torch.utils.data import DataLoader, IterableDataset
+from juice.representations import IMAGE_SPACES
+from juice.train.data import read_manifest, balanced_slot_assignment
+
+
+def prepare_record(record, cfg):
+    dims = {"V": (256, IMAGE_SPACES[cfg.image_space].latent_dim),
+            "L": (cfg.text_canvas, 512), "A": (cfg.action_horizon, cfg.action_dim)}
+    out = {}
+    for key, shape in {"current_vision": dims["V"], "instruction": dims["L"]}.items():
+        value = torch.as_tensor(record[key], dtype=torch.float32)
+        if tuple(value.shape) != shape or not torch.isfinite(value).all():
+            raise ValueError(f"{key}: expected finite {shape}")
+        out[key] = value
+        mask_value = record["instruction_mask"] if key == "instruction" else record.get(f"{key}_mask", torch.ones(shape[0]))
+        out[f"{key}_mask"] = torch.as_tensor(mask_value, dtype=torch.bool)
+        if out[f"{key}_mask"].shape != (shape[0],) or not out[f"{key}_mask"].any():
+            raise ValueError(f"invalid {key}_mask")
+    out["present"], out["valid"] = {}, {}
+    for m, key in zip("VLA", ("future_vision", "language_plan", "action")):
+        present = key in record
+        if key == "language_plan" and present and "language_plan_mask" not in record:
+            raise ValueError("language_plan requires language_plan_mask")
+        x = torch.as_tensor(record[key], dtype=torch.float32) if present else torch.zeros(dims[m])
+        mask = torch.as_tensor(record.get(f"{key}_mask", torch.ones(dims[m][0]) if present else torch.zeros(dims[m][0])), dtype=torch.bool)
+        if tuple(x.shape) != dims[m] or not torch.isfinite(x).all() or mask.shape != dims[m][:1]:
+            raise ValueError(f"{key}: invalid shape, mask, or nonfinite values")
+        if present and not mask.any():
+            raise ValueError(f"{key}: present group has no valid tokens")
+        out[m] = x
+        out["valid"][m] = mask
+        out["present"][m] = torch.tensor(present)
+    goal = record.get("goal_vision")
+    out["goal_present"] = torch.tensor(goal is not None)
+    out["goal_vision"] = torch.zeros(dims["V"]) if goal is None else torch.as_tensor(goal, dtype=torch.float32)
+    out["goal_valid"] = torch.full(dims["V"][:1], goal is not None, dtype=torch.bool)
+    if out["goal_vision"].shape != dims["V"] or not torch.isfinite(out["goal_vision"]).all():
+        raise ValueError("invalid goal_vision")
+    if out["present"]["A"] and out["A"].abs().max() > 1.00001:
+        raise ValueError("action must be normalized to [-1,1] using training-split bounds")
+    return out
+
+
+class FeatureStream(IterableDataset):
+    def __init__(self, cfg, rank, world, resume_key):
+        self.cfg, self.rank, self.world = cfg, rank, world
+        self.seed = cfg.seed + resume_key * 7368787
+        self.paths, self.weights = [], []
+        for manifest, count in zip(cfg.train_manifests, cfg.train_manifest_counts):
+            entries = read_manifest(manifest)
+            if not entries or count <= 0:
+                raise ValueError(f"empty manifest or invalid count: {manifest}")
+            self.paths.extend(entries)
+            self.weights.extend([count / len(entries)] * len(entries))
+        if len(set(self.paths)) != len(self.paths):
+            raise ValueError("duplicate feature records in manifests")
+        for p in self.paths:
+            if not Path(p).is_file():
+                raise FileNotFoundError(p)
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        worker, workers = (info.id, info.num_workers) if info else (0, 1)
+        slot = self.rank * workers + worker
+        indices = balanced_slot_assignment(list(range(len(self.paths))), self.weights, self.world * workers)[slot]
+        if not indices:
+            raise ValueError("fewer feature records than workers; reduce num_workers")
+        rng = random.Random(self.seed + slot)
+        while True:
+            i = rng.choices(indices, weights=[self.weights[j] for j in indices])[0]
+            yield prepare_record(torch.load(self.paths[i], map_location="cpu", weights_only=True), self.cfg)
+
+
+def make_vla_loader(cfg, rank, world, resume_key=0):
+    return DataLoader(FeatureStream(cfg, rank, world, resume_key), batch_size=cfg.micro_batch_size,
+        num_workers=cfg.num_workers, drop_last=True,
+        prefetch_factor=cfg.prefetch if cfg.num_workers else None)

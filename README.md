@@ -16,6 +16,52 @@ pixels. A small parallel text head (the parallel decoder of the paper) changes t
 
 This repository holds the code for inference, evaluation, training (all stages) and data preparation.
 
+## Native Joint Flow VLA：无 State 连续 Action Baseline
+
+本分支在原 JUICE 图文模型上增加可选 **Action 第三流**。当前视觉 `I_t` 和任务指令 `L_inst` 为条件；Future Vision、Language Plan、Action 为可选目标。**没有机器人 State/proprioception/sensor 输入。** 当前视觉与未来视觉、Instruction 与 Plan 分开编码，避免标签泄漏。
+
+默认 Baseline 直接对归一化 `A ∈ R^(H×d_a)` 做连续 Flow；`action_adapter: continuous` 只用 Linear 连接主干维度，无量化、无 Action Tokenizer。可选 `mlp` 改变输入/输出投影，损失仍在相同连续动作坐标计算。
+
+参考 [Dynin-Robotics](https://arxiv.org/abs/2609.13053) 的 **Policy / World Modeling / Goal Prediction / Task Understanding** 条件与目标布局，并加入 objective embedding。Dynin 原文使用均匀量化动作与离散 masked diffusion；本实现是 **JUICE 连续 Flow 适配，不是离散算法复现**。论文的 Action–WM 联合去噪为推理组合；本仓库可选的 Joint VA/LA/LVA 监督训练是额外实验。
+
+### 训练
+
+```bash
+# 先准备 frozen-feature .pt 窗口文件及 manifest，并按真实机器人修改 action_dim/H/count。
+python -m scripts.train.train --config configs/vla/action_baseline.yaml
+# 可选：混合论文四种任务方向；示例权重不是论文 schedule 或 loss 系数。
+python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
+```
+
+继续沿用原训练器的 DDP、梯度累积、EMA、checkpoint 和 resume。`action_dim: 0` 保留原图文路径。VLA 使用预编码特征缓存，不在训练时加载冻结 Encoder；原始图像/文本可用既有 JUICE Encoder 在上游分别编码。真实训练仍需 GPU、数据和模型权重；本次没有配置这些资源或训练机器人策略。
+
+每个 manifest 列出一个窗口一个 `.pt` 文件，保存纯张量字典（`torch.load(weights_only=True)`）：
+
+| 字段 | Shape / 用途 |
+|---|---|
+| current_vision | `[256,D_v]` 当前视觉，D_v=1152 或 1024 |
+| instruction / instruction_mask | `[text_canvas,512]` / `[text_canvas]`，独立编码的指令及内容+EOS mask |
+| action | `[action_horizon,action_dim]`，按训练集统计归一化到 [-1,1] |
+| future_vision | 可选 `[256,D_v]`，下一观测/窗口末端，不能与终点目标混用 |
+| goal_vision | 可选 `[256,D_v]`，任务/子任务终点 |
+| language_plan / language_plan_mask | 可选 `[text_canvas,512]` / `[text_canvas]`，独立编码的计划 |
+
+视觉与语言归一化遵循原 JUICE。Action 的 lower/upper、坐标系、字段顺序和频率必须保存并在部署时复用；`juice.action.ActionNormalizer` 支持稳健界限缩放和反变换。先按轨迹划分数据，再生成完整窗口，避免相邻窗口泄漏。缺失目标的样本只参与标签齐备的任务；无可用任务时报错。
+
+### 目标与采样
+
+`vla_tasks` 支持 `action_policy`、`world_model`、`goal_prediction`、`task_understanding`、`language_planning`、`inverse_dynamics`、`plan_conditioned_action`、`goal_conditioned_action`、`joint_va`、`joint_la`、`joint_lv`、`joint_lva`。默认只训练 Action；四任务与三目标训练需分别评估。
+
+`juice.vla_sampling.sample_vla(model.eval(), batch, task="action_policy")` 返回归一化 V/L/A 状态，目标从新噪声开始，条件保持干净。`batch` 是缓存 DataLoader 输出，须先移动到模型设备。Action 反归一化、机器人控制、像素/文字解码需由外部接口完成；原 `JuicePipeline` 不提供机器人控制 API。
+
+```bash
+python -m unittest tests.test_vla tests.test_vla_data
+```
+
+[修订后的设计文档](docs/native_joint_flow_vla/README.md) 记录任务矩阵、论文差异、数据约束、实现状态和后续评估。以下为原 JUICE 使用说明。
+
+---
+
 ## Contents
 
 1. [Environment](#1-environment)

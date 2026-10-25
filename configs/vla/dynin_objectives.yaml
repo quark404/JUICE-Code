@@ -1,0 +1,20 @@
+# Continuous-flow adaptation of Dynin's four task directions, NOT its loss/schedule.
+run_name: dynin_objectives_continuous
+train_manifests: [data/robot/train.txt]
+train_manifest_counts: [1000]
+image_space: siglip2
+action_dim: 7
+action_horizon: 16
+action_adapter: continuous
+vla_tasks:
+  action_policy: 1.0
+  world_model: 1.0
+  goal_prediction: 1.0
+  task_understanding: 1.0
+num_workers: 0
+batch_size: 8
+micro_batch_size: 2
+grad_accum_steps: 4
+num_steps: 10000
+warmup_steps: 500
+compile_model: false

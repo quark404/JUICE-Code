@@ -45,7 +45,8 @@ def update_ema(ema: torch.nn.Module, model: torch.nn.Module, decay: float) -> No
 
 
 def build_model(cfg: TrainConfig) -> MMRiT:
-    return MMRiT(MMRiTConfig(image_latent_dim=IMAGE_SPACES[cfg.image_space].latent_dim))
+    return MMRiT(MMRiTConfig(image_latent_dim=IMAGE_SPACES[cfg.image_space].latent_dim,
+        action_dim=cfg.action_dim, action_adapter=cfg.action_adapter, action_hidden_dim=cfg.action_hidden_dim))
 
 
 def load_weights(path: str | Path) -> dict[str, torch.Tensor]:
@@ -90,6 +91,9 @@ def encode_micro_batch(batch: dict, device, image_encoder, text_encoder, need_kn
 
 def micro_step_loss(model, enc: dict, cfg: TrainConfig) -> tuple[torch.Tensor, dict]:
     with torch.autocast("cuda", dtype=torch.bfloat16):
+        if cfg.action_dim:
+            from juice.train.vla import vla_flow_loss
+            return vla_flow_loss(model, enc, cfg)
         return joint_flow_loss(
             model, enc["img"], enc["txt"], enc["text"], cfg, enc["spans"], enc["qa_cond"],
             qa_window_row=enc["qa_window"], img_known=enc["img_known"], img_x0_in=enc["img_in"],
@@ -131,8 +135,10 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
 
-    text_encoder = T5TextEncoder().to(device)
-    image_encoder = build_image_encoder(cfg.image_space).to(device)
+    text_encoder = image_encoder = None
+    if not cfg.action_dim:
+        text_encoder = T5TextEncoder().to(device)
+        image_encoder = build_image_encoder(cfg.image_space).to(device)
     model = build_model(cfg).to(device)
     start_step, opt_state = 0, None
     if resume:
@@ -140,7 +146,15 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
         model.load_state_dict(payload["model"], strict=True)
         start_step, opt_state = int(payload["step"]), payload["optimizer"]
     elif cfg.init_from:
-        model.load_state_dict(load_weights(cfg.init_from), strict=True)
+        weights = load_weights(cfg.init_from)
+        if cfg.action_dim:
+            model.init_weights()
+            missing, unexpected = model.load_state_dict(weights, strict=False)
+            allowed = lambda k: k.startswith(("action.", "act_", "visual_role.", "language_role.", "objective_embed.")) or ".act_" in k
+            if unexpected or any(not allowed(k) for k in missing):
+                raise ValueError(f"incompatible initialization: missing={missing}, unexpected={unexpected}")
+        else:
+            model.load_state_dict(weights, strict=True)
     else:
         model.init_weights()
     ema = copy.deepcopy(model).requires_grad_(False)
@@ -167,7 +181,11 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
         opt.load_state_dict(opt_state)
 
     # A resumed run reads a new data order (the resume step is part of the stream seed).
-    loader = make_loader(cfg, rank, world, text_encoder.tokenizer, resume_key=start_step)
+    if cfg.action_dim:
+        from juice.train.vla_data import make_vla_loader
+        loader = make_vla_loader(cfg, rank, world, resume_key=start_step)
+    else:
+        loader = make_loader(cfg, rank, world, text_encoder.tokenizer, resume_key=start_step)
     data = iter(loader)
     end_step = cfg.num_steps if max_steps is None else min(cfg.num_steps, start_step + max_steps)
     log_file = (out_dir / "log.jsonl").open("a") if rank == 0 else None
@@ -175,7 +193,13 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
     for step in range(start_step, end_step):
         sums: dict[str, torch.Tensor] = {}
         for accum in range(cfg.grad_accum_steps):
-            enc = encode_micro_batch(next(data), device, image_encoder, text_encoder, cfg.img_known_inpaint)
+            batch = next(data)
+            if cfg.action_dim:
+                def move(x):
+                    return {k: move(v) for k, v in x.items()} if isinstance(x, dict) else x.to(device)
+                enc = move(batch)
+            else:
+                enc = encode_micro_batch(batch, device, image_encoder, text_encoder, cfg.img_known_inpaint)
             last = accum == cfg.grad_accum_steps - 1
             sync = contextlib.nullcontext() if (last or not distributed) else model.no_sync()
             with sync:

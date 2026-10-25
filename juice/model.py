@@ -56,6 +56,10 @@ class MMRiTConfig:
     token_time: bool = True           # additive token-wise time embeddings
     attention_impl: str = "sdpa"      # "sdpa" | "einsum" (same math)
 
+    action_dim: int = 0              # 0 preserves the original two-stream architecture
+    action_adapter: str = "continuous"  # continuous (linear) | mlp
+    action_hidden_dim: int = 256
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -120,14 +124,14 @@ def apply_2d_rope(x: torch.Tensor, grid: int, theta: int = 10000) -> torch.Tenso
     """x: [B, H, grid*grid, d]; row-major patches. Half of each head encodes the row,
     half encodes the column."""
     _, _, n, d = x.shape
-    if n != grid * grid:
-        raise ValueError(f"expected {grid * grid} image tokens, got {n}")
+    if n % (grid * grid) != 0:
+        raise ValueError(f"expected complete {grid}x{grid} image groups, got {n} tokens")
     rope_dim = d // 2
     inv = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / rope_dim))
     freqs = torch.einsum("n,f->nf", torch.arange(grid, device=x.device, dtype=torch.float32), inv)
     f_h, f_w = torch.broadcast_tensors(freqs[:, None, :], freqs[None, :, :])
     angles = torch.cat([f_h, f_w], dim=-1)
-    angles = torch.cat([angles, angles], dim=-1).reshape(n, d)
+    angles = torch.cat([angles, angles], dim=-1).reshape(grid * grid, d).repeat(n // (grid * grid), 1)
     return x * angles.cos()[None, None].to(x.dtype) + rotate_half(x) * angles.sin()[None, None].to(x.dtype)
 
 
@@ -208,6 +212,11 @@ class JointBlock(nn.Module):
         self.txt_proj = nn.Linear(inner, h)
         self.img_mlp = SwiGLU(h, int(h * cfg.mlp_ratio))
         self.txt_mlp = SwiGLU(h, int(h * cfg.mlp_ratio))
+        if cfg.action_dim:
+            self.act_norm1, self.act_norm2 = RMSNorm(h), RMSNorm(h)
+            self.act_qkv = nn.Linear(h, inner * 3)
+            self.act_proj = nn.Linear(inner, h)
+            self.act_mlp = SwiGLU(h, int(h * cfg.mlp_ratio))
 
     def _rope_text(self, x: torch.Tensor) -> torch.Tensor:
         """1D RoPE over [text slots, time tokens]; see TIME_TOKEN_ROPE_ANCHOR."""
@@ -219,7 +228,8 @@ class JointBlock(nn.Module):
         )
 
     def forward(
-        self, img: torch.Tensor, txt: torch.Tensor, txt_key_mask: torch.Tensor | None = None
+        self, img: torch.Tensor, txt: torch.Tensor, txt_key_mask: torch.Tensor | None = None,
+        act: torch.Tensor | None = None, joint_key_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         b, li, _ = img.shape
         lt = txt.shape[1]
@@ -236,11 +246,24 @@ class JointBlock(nn.Module):
         if txt_key_mask is not None:
             keep = torch.cat([txt_key_mask.to(torch.bool), txt_key_mask.new_ones((b, li), dtype=torch.bool)], dim=1)
             bias = key_padding_bias(keep, q.dtype)
+        if act is not None:
+            la = act.shape[1]
+            qa, ka, va = self.act_qkv(self.act_norm1(act)).view(b, la, 3, self.num_heads, self.head_dim).unbind(2)
+            q = torch.cat([q, apply_1d_rope(self.q_norm(qa).transpose(1, 2))], dim=2)
+            k = torch.cat([k, apply_1d_rope(self.k_norm(ka).transpose(1, 2))], dim=2)
+            v = torch.cat([v, va.transpose(1, 2)], dim=2)
+            if joint_key_mask is None:
+                raise ValueError("action attention requires a joint key mask")
+            bias = key_padding_bias(joint_key_mask, q.dtype)
         out = attention(q, k, v, self.head_dim, self.attention_impl, bias).transpose(1, 2)
         txt = txt + self.txt_proj(out[:, :lt].reshape(b, lt, -1))
-        img = img + self.img_proj(out[:, lt:].reshape(b, li, -1))
+        img = img + self.img_proj(out[:, lt:lt + li].reshape(b, li, -1))
         img = img + self.img_mlp(self.img_norm2(img))
         txt = txt + self.txt_mlp(self.txt_norm2(txt))
+        if act is not None:
+            act = act + self.act_proj(out[:, lt + li:].reshape(b, la, -1))
+            act = act + self.act_mlp(self.act_norm2(act))
+            return img, txt, act
         return img, txt
 
 
@@ -249,6 +272,8 @@ class MMRiT(nn.Module):
 
     def __init__(self, cfg: MMRiTConfig):
         super().__init__()
+        if cfg.action_dim < 0 or (cfg.action_dim and not cfg.token_time):
+            raise ValueError("Action models require action_dim > 0 and token_time=True")
         self.cfg = cfg
         h = cfg.hidden_size
         self.latent_in = nn.Linear(cfg.image_latent_dim, h)
@@ -268,6 +293,17 @@ class MMRiT(nn.Module):
         self.final = nn.Linear(h, cfg.image_latent_dim)
         self.txt_final_norm = RMSNorm(h)
         self.txt_final = nn.Linear(h, cfg.text_dim)
+        if cfg.action_dim:
+            from juice.action import ActionAdapter
+            self.action = ActionAdapter(cfg.action_dim, h, cfg.action_adapter, cfg.action_hidden_dim)
+            self.objective_embed = nn.Embedding(12, h)
+            self.visual_role = nn.Embedding(2, h)
+            self.language_role = nn.Embedding(2, h)
+            self.act_t_embed = TimestepEmbedder(h)
+            self.act_tok_t_proj = nn.Linear(h, h)
+            self.act_t_tokens = nn.Parameter(torch.zeros(1, cfg.time_tokens, h))
+            for block in self.blocks:
+                block.n_time_tokens = 3 * cfg.time_tokens
 
     @torch.no_grad()
     def init_weights(self) -> None:
@@ -312,8 +348,16 @@ class MMRiT(nn.Module):
         txt: torch.Tensor,
         t_txt: torch.Tensor,
         txt_key_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Predict the clean image and text states.
+        *, action: torch.Tensor | None = None, t_action: torch.Tensor | None = None,
+        image_key_mask: torch.Tensor | None = None, action_key_mask: torch.Tensor | None = None,
+        image_condition: torch.Tensor | None = None, language_condition: torch.Tensor | None = None,
+        image_condition_mask: torch.Tensor | None = None, language_condition_mask: torch.Tensor | None = None,
+        objective: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Predict clean states; Action-enabled models return (vision, language, action).
+
+        image_condition and language_condition are separately encoded clean groups,
+        distinct from target future vision / plan states. No proprioceptive State input.
 
         img:          [B, 256, D_img] noisy (or clean) normalized image state
         t_img:        [B] or [B, 256] image time(s)
@@ -325,9 +369,35 @@ class MMRiT(nn.Module):
                       see the true length).
         Returns (image x0 [B, 256, D_img], text x0 [B, L, D_txt]), both float32.
         """
+        if bool(self.cfg.action_dim) != (action is not None):
+            raise ValueError("action-enabled models require action and t_action; legacy models reject action")
+        if action is not None and t_action is None:
+            raise ValueError("t_action is required")
+        n_img_cond = n_txt_cond = 0
+        def prepend(x, t, mask, condition, condition_mask):
+            b, n = x.shape[:2]
+            t = t[:, None].expand(-1, n) if t.ndim == 1 else t
+            mask = torch.ones(b, n, device=x.device, dtype=torch.bool) if mask is None else mask
+            if condition is None:
+                return x, t, mask, 0
+            nc = condition.shape[1]
+            cm = torch.ones(b, nc, device=x.device, dtype=torch.bool) if condition_mask is None else condition_mask
+            return (torch.cat([condition, x], 1), torch.cat([t.new_ones(b, nc), t], 1),
+                    torch.cat([cm, mask], 1), nc)
+        if action is not None:
+            img, t_img, image_key_mask, n_img_cond = prepend(img, t_img, image_key_mask, image_condition, image_condition_mask)
+            txt, t_txt, txt_key_mask, n_txt_cond = prepend(txt, t_txt, txt_key_mask, language_condition, language_condition_mask)
+        elif image_condition is not None or language_condition is not None:
+            raise ValueError("separate condition groups require an action-enabled model")
         n_txt = txt.shape[1]
-        img_tokens = self.latent_in(img) + self.pos_embed.to(device=img.device, dtype=img.dtype)
+        pos = self.pos_embed.repeat(1, img.shape[1] // self.num_image_tokens, 1)
+        img_tokens = self.latent_in(img) + pos.to(device=img.device, dtype=img.dtype)
         txt_tokens = self.txt_bottleneck_out(self.txt_bottleneck_in(txt))
+        if action is not None:
+            vi = torch.arange(img.shape[1], device=img.device) >= n_img_cond
+            li = torch.arange(n_txt, device=txt.device) >= n_txt_cond
+            img_tokens = img_tokens + self.visual_role(vi.long()).to(img_tokens.dtype)
+            txt_tokens = txt_tokens + self.language_role(li.long()).to(txt_tokens.dtype)
         if t_img.ndim == 2 or t_txt.ndim == 2 or self.cfg.token_time:
             if not self.cfg.token_time:
                 raise ValueError("per-token times need token_time=True")
@@ -343,20 +413,52 @@ class MMRiT(nn.Module):
             t_img = t_img.mean(dim=1) if t_img.ndim == 2 else t_img
             t_txt = t_txt.mean(dim=1) if t_txt.ndim == 2 else t_txt
         for block in self.txt_blocks:
-            txt_tokens = block(txt_tokens, key_mask=txt_key_mask)
+            # An absent language stream must not produce all-masked attention NaNs.
+            preamble_mask = txt_key_mask
+            if action is not None and preamble_mask is not None:
+                preamble_mask = preamble_mask | ~preamble_mask.any(dim=1, keepdim=True)
+            txt_tokens = block(txt_tokens, key_mask=preamble_mask)
+        if action is not None:
+            objective = torch.zeros(txt.shape[0], device=txt.device, dtype=torch.long) if objective is None else objective
+            objective_embedding = self.objective_embed(objective)[:, None]
         dtype = txt_tokens.dtype
         img_time = self.img_t_tokens.to(dtype=dtype) + self.t_embed(t_img).to(dtype=dtype)[:, None]
         txt_time = self.txt_t_tokens.to(dtype=dtype) + self.txt_t_embed(t_txt).to(dtype=dtype)[:, None]
+        if action is not None:
+            img_time = img_time + objective_embedding.to(dtype)
+            txt_time = txt_time + objective_embedding.to(dtype)
         b = txt_tokens.shape[0]
         txt_tokens = torch.cat([txt_tokens, img_time.expand(b, -1, -1), txt_time.expand(b, -1, -1)], dim=1)
+        act_tokens = None
+        if action is not None:
+            act_tokens = self.action.encode(action)
+            ta = t_action[:, None].expand(-1, action.shape[1]) if t_action.ndim == 1 else t_action
+            act_tokens = act_tokens + self.act_tok_t_proj(
+                self.act_t_embed(ta.reshape(-1)).view(b, action.shape[1], -1)).to(act_tokens.dtype)
+            act_time = self.act_t_tokens.to(dtype) + self.act_t_embed(ta.mean(1)).to(dtype)[:, None]
+            act_time = act_time + objective_embedding.to(dtype)
+            txt_tokens = torch.cat([txt_tokens, act_time.expand(b, -1, -1)], dim=1)
         side_mask = None
         if txt_key_mask is not None:
             n_time = txt_tokens.shape[1] - n_txt
             side_mask = torch.cat(
                 [txt_key_mask.to(torch.bool), txt_key_mask.new_ones((b, n_time), dtype=torch.bool)], dim=1
             )
+        joint_mask = None
+        if action is not None:
+            def keep(mask, n):
+                return torch.ones(b, n, device=img.device, dtype=torch.bool) if mask is None else mask.bool()
+            joint_mask = torch.cat([
+                keep(txt_key_mask, n_txt), keep(None, 3 * self.cfg.time_tokens),
+                keep(image_key_mask, img.shape[1]), keep(action_key_mask, action.shape[1])], dim=1)
         for block in self.blocks:
-            img_tokens, txt_tokens = block(img_tokens, txt_tokens, txt_key_mask=side_mask)
-        img_x0 = self.final(self.final_norm(img_tokens)).float()
-        txt_x0 = self.txt_final(self.txt_final_norm(txt_tokens[:, :n_txt])).float()
+            if action is None:
+                img_tokens, txt_tokens = block(img_tokens, txt_tokens, txt_key_mask=side_mask)
+            else:
+                img_tokens, txt_tokens, act_tokens = block(
+                    img_tokens, txt_tokens, act=act_tokens, joint_key_mask=joint_mask)
+        img_x0 = self.final(self.final_norm(img_tokens[:, n_img_cond:])).float()
+        txt_x0 = self.txt_final(self.txt_final_norm(txt_tokens[:, n_txt_cond:n_txt])).float()
+        if action is not None:
+            return img_x0, txt_x0, self.action.decode(act_tokens).float()
         return img_x0, txt_x0
