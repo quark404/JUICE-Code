@@ -28,6 +28,103 @@ This repository holds the code for inference, evaluation, training (all stages) 
 
 参考 [Dynin-Robotics](https://arxiv.org/abs/2609.13053) 的 **Policy / World Modeling / Goal Prediction / Task Understanding** 条件与目标布局，并加入 objective embedding。Dynin 原文使用均匀量化动作与离散 masked diffusion；本实现是 **JUICE 连续 Flow 适配，不是离散算法复现**。论文的 Action–WM 联合去噪为推理组合；本仓库可选的 Joint VA/LA/LVA 监督训练是额外实验。
 
+### 第一版动作处理：从原生控制量到模型，再回到控制器
+
+以 `H=16`、原生 `d=7` 为例，模型一次生成未来16个控制步，每步包含7个动作通道；如果控制周期是50ms，这个chunk覆盖0.8秒。`H` 是动作时间长度，`d` 是每步控制量的维度，`32` 是模型统一输入/输出宽度，三者不能混用。7D可以是已定义好的EEF控制，也可以是某种原生关节控制；单凭维度不能确定其语义。
+
+```text
+训练数据准备：
+物理动作 A_phys [16,7]
+  → 按7个原生通道分别归一化
+  → A_norm [16,7]（保存到.pt缓存）
+  → DataLoader尾部补零
+  → A_0 [16,32]（干净训练标签）
+
+训练：A_0 + 高斯噪声 → 带噪A_tau → Linear(32,width)
+       → 与V/L共享Joint Attention → Linear(width,32) → 预测干净A_0
+
+推理：高斯噪声 [B,16,32] → 多步Euler去噪 → A_pred [B,16,32]
+       → 每个样本取前d维（A_native）→ 原生通道反归一化 → 外部机器人控制器
+```
+
+**① 原生连续动作 `[H,d]`：先明确每个数是什么。** 每行对应一个控制时刻，不是一个离散token。数据适配器应记录字段顺序、单位、坐标系、旋转表示、absolute/delta约定、夹爪极性和控制周期。例如某个已转换好的EEF接口可以是 `[dx,dy,dz,rx,ry,rz,g_absolute]`；原生14D双臂或8D关节控制也可直接保留，不要求先压成7D。图像、指令、动作窗口必须时间对齐，训练/验证先按轨迹划分再切窗口。
+
+**② 归一化：在原生d维上操作，使用训练集统计。** 选择并保存每个通道的下/上界 `l_j,u_j`。可用训练集稳健分位数，例如运动通道p01/p99；这是可选统计方案，不声称复制了所有OpenPI数据集的归一化配置。夹爪使用自己的校准范围，并保持原本的绝对控制语义。`ActionNormalizer` 实现：
+
+```text
+A_norm[...,j] = clip(2*(A_phys[...,j]-l_j)/max(u_j-l_j,eps)-1, -1, 1)
+```
+
+常量或数值范围极小的通道归零。统计只能来自训练集，不能对每个动作chunk临时计算，否则会丢失动作幅度的含义。不同来源使用自己的统计时，部署端也必须知道该来源，才能用对应统计还原。裁剪是有损的，超出统计范围的原值不会在反变换时恢复。
+
+归一化在上游缓存生成阶段完成；当前DataLoader只校验输入有限且位于[-1,1]，不会自动拟合统计或对物理动作再次归一化。应将统计文件和动作schema与模型一起管理。例子中位移通道范围是[-0.05,0.05]米，0.02米归一化为0.4；夹爪范围是[0,1]，完全张开1归一化为1，而归一化0对应中间开度0.5。
+
+**③ 尾部补零：只统一张量形状。** `pad_actions` 将每个原生动作向量变成 `[a_1,...,a_d,0,...,0]`；`H`与原生字段顺序不变。7D补25个零，14D补18个零，collate后都是 `[B,H,32]`。补零只做一次，缓存仍保存原生 `[H,d]`。`d>32`时明确报错，不静默截断。数据输出 `action_native_dims: long[B]`，用于推理截取；没有动作标签时，必须通过记录的 `action_native_dim` 或配置回退值提供原生宽度。
+
+尾部0是归一化空间的占位值，不是额外物理动作，也不是机器人State。V1不启用逐维Mask或layout embedding；原生维度元信息只用于补齐校验和输出截取，不会作为模型条件。因此padding使混合维度batch成为可能，但不会自动对齐不同机器人的关节/末端语义，也不保证跨机器人迁移。
+
+**④ JUICE连续Flow：直接对动作值加噪、预测。** 训练一个Action目标时，为每个样本采样 `tau_A=sigmoid(N(0,1))`，默认该动作chunk的H个时间步共享这个时间，独立采样与标签同形状的高斯噪声。默认动作噪声标准差为1：
+
+```text
+A_tau = tau_A*A_0 + (1-tau_A)*epsilon
+```
+
+这里 `tau=0` 是纯噪声、`tau=1` 是干净动作；它是Flow去噪进度，不是机器人执行时刻。Action-only任务中，当前视觉与指令保持干净，真实未来视觉和真实Plan不作为可见条件；联合任务则为所选V/L/A目标独立采样噪声时间。
+
+模型把每个动作时间步的32维向量经Linear投影为一个Action Token，所以有H个Action Tokens，而不是 `H*32` 个标量token。这些Token带有Action时间条件与一维位置编码，在双向Joint Attention中与V/L交互，再通过Action输出头预测干净 `[B,H,32]`。Linear投影是可训练的主干边界，不是独立Action Tokenizer；监督空间始终是归一化动作坐标。
+
+V1动作损失采用当前JUICE的速度空间误差：
+
+```text
+L_A = mean_active(b,h) mean_j=1..32 [
+    (A_hat_0[b,h,j]-A_0[b,h,j]) / max(1-tau_A[b],0.05)
+]^2
+```
+
+目标为Action的有效时间步才计算该损失，再乘 `lambda_action` 加入总损失。为匹配所参考的OpenPI全宽度平均机制，**32维全部参与加噪和损失，包括padding通道**；其clean target为零。padding通道的带噪输入通常不为零，模型需要学会将其预测回零。不同原生d下，这不是“只平均真实动作维度”的损失；若要逐维有效元素平均，应显式选用额外的heterogeneous分支，不把二者混为同一个实验。
+
+**⑤ 推理与截取：从噪声生成，不输入真实未来动作。** `sample_vla` 从 `[B,H,32]` 高斯噪声开始，每步用预测的干净动作估计速度并做Euler更新：
+
+```text
+v_tau = (A_hat_0-A_tau)/max(1-tau,0.05)
+A_next = A_tau + delta_tau*v_tau
+```
+
+默认25个去噪步，与H=16个动作执行步无关；每次模型前向同时更新整个动作chunk，并非按动作时间自回归生成。得到的padding尾部不保证严格等于零，因此每个样本只取前d维。返回值中 `A` 是模型宽度张量，`A_native` 是不同原生宽度的Tensor列表；控制器使用后者，不对完整32维执行反归一化。
+
+**⑥ 反归一化与执行：复用同一套原生通道统计。** 当前 `ActionNormalizer.denormalize` 先将预测裁剪到[-1,1]，再计算：
+
+```text
+A_phys[...,j] = l_j + (clip(A_native[...,j],-1,1)+1)/2*(u_j-l_j)
+```
+
+这只恢复原有数值尺度，不做关节→EEF、delta→absolute、坐标系或控制频率转换。输出仍遵循训练标签的控制语义。若标签是delta动作，控制器就必须按相同delta约定解释；若需要位置目标等其他接口，应由外部适配器转换。执行整个chunk或只执行前几步后重新观测，都由外部控制逻辑决定，当前采样API不会自动驱动机器人或实现闭环重规划。
+
+最小数据准备与输出示例（7D字段/界限仅作示意，实际应使用自己的schema和训练统计）：
+
+```python
+import torch
+from juice.action import ActionNormalizer
+from juice.vla_sampling import sample_vla
+
+normalizer = ActionNormalizer(
+    lower=[-.05, -.05, -.05, -.2, -.2, -.2, 0.],
+    upper=[ .05,  .05,  .05,  .2,  .2,  .2, 1.],
+)
+# 上游：A_phys来自数据集，shape=[16,7]；不要在此处手动补零。
+record["action"] = normalizer.normalize(A_phys)
+record["action_native_dim"] = 7
+# record还需包含独立编码的current_vision、instruction和instruction_mask。
+# 保存后由prepare_record/DataLoader补到32D，batch再移动至模型设备。
+
+result = sample_vla(model.eval(), batch, task="action_policy", steps=25)
+action_physical = normalizer.denormalize(result["A_native"][0])  # [16,7]
+# 如果batch包含不同来源，每个样本使用其对应的normalizer。
+# 然后将action_physical交给匹配schema的外部控制器。
+```
+
+源码对应：归一化/补齐/截取在 [action.py](juice/action.py)，记录转换在 [vla_data.py](juice/train/vla_data.py)，Flow目标在 [vla.py](juice/train/vla.py)，Action Token与Joint Attention在 [model.py](juice/model.py)，Euler与原生输出在 [vla_sampling.py](juice/vla_sampling.py)。该流程的代码测试已完成，真实数据训练和机器人闭环效果尚未验证。
+
 ### 训练
 
 ```bash
