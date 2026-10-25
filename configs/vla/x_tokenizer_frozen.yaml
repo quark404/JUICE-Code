@@ -1,0 +1,22 @@
+# Optional frozen codec branch: raw records follow the checkpoint's exact 26D layout.
+run_name: frozen_x_tokenizer_action
+train_manifests: [data/robot/x_tokenizer_train.txt]
+train_manifest_counts: [1000]
+image_space: siglip2
+action_mode: fixed  # fixed checkpoint input schema; can mix robot IDs and DOF masks per record
+action_representation: x_tokenizer
+action_dim: 26     # raw checkpoint action width, NOT its latent hidden width
+action_horizon: 16
+x_tokenizer_checkpoint: /workspace/models/x_tokenizer/xtokenizer.pth
+x_tokenizer_latent_scale: 1.0  # optional fixed calibration from encoded training data
+x_tokenizer_use_anchor: false # explicitly no proprioceptive anchor; validate reconstruction first
+x_tokenizer_robot_type_id: 0  # Unknown, or override codec_robot_type_id per record
+action_adapter: continuous # train JUICE boundary only; codec parameters stay frozen
+vla_tasks: {action_policy: 1.0}
+num_workers: 0
+batch_size: 8
+micro_batch_size: 2
+grad_accum_steps: 4
+num_steps: 10000
+warmup_steps: 500
+compile_model: false

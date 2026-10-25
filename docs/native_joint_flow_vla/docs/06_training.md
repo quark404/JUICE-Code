@@ -9,3 +9,5 @@
 `configs/vla/dynin_objectives.yaml` 提供 PO/WM/GP/TU 等权任务采样示例，不是论文优化配置。论文 §4.2 的 objective schedule multiplicity、lambda=(1,.2,.05,.2)、离散 inverse-mask-rate CE 和 Policy bin MAE 与本项目不同。不要把这些 loss 系数直接当作任务抽样概率。
 
 实际训练前需要数据缓存、训练集归一化统计和 NVIDIA GPU。CPU 测试只验证接口、反向传播及信息隔离，不证明策略已训练成功。Baseline 的 action_dim=7 是例子，必须按机器人动作布局修改。
+
+可选异构模式增加逐元素 Action Mask，并采用先样本内、再样本间平均的动作损失；固定模式公式不变。接口与迁移见 [异构 Action](12_heterogeneous_actions.md)。

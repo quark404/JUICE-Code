@@ -16,6 +16,18 @@ def prepare_record(record, cfg):
     dims = {"V": (256, IMAGE_SPACES[cfg.image_space].latent_dim),
             "L": (cfg.text_canvas, 512), "A": (cfg.action_horizon, cfg.action_dim)}
     out = {}
+    heterogeneous = getattr(cfg, "action_mode", "fixed") == "heterogeneous"
+    packed_action = element_mask = None
+    if heterogeneous:
+        from juice.action_schema import ActionSchema
+        schema = ActionSchema(cfg.action_fields, cfg.action_layouts)
+        layout = record.get("action_layout")
+        packed_action, element_mask = schema.pack(record.get("action"), layout, cfg.action_horizon,
+            record.get("action_dim_mask"), record.get("action_mask"))
+        out["action_layout_ids"] = torch.tensor(schema.layout_id(layout), dtype=torch.long)
+        out["action_dim_mask"] = element_mask
+    elif "action_dim_mask" in record or "action_layout" in record:
+        raise ValueError("native action layout metadata requires action_mode=heterogeneous")
     for key, shape in {"current_vision": dims["V"], "instruction": dims["L"]}.items():
         value = torch.as_tensor(record[key], dtype=torch.float32)
         if tuple(value.shape) != shape or not torch.isfinite(value).all():
@@ -31,7 +43,11 @@ def prepare_record(record, cfg):
         if key == "language_plan" and present and "language_plan_mask" not in record:
             raise ValueError("language_plan requires language_plan_mask")
         x = torch.as_tensor(record[key], dtype=torch.float32) if present else torch.zeros(dims[m])
+        if m == "A" and heterogeneous:
+            x = packed_action
         mask = torch.as_tensor(record.get(f"{key}_mask", torch.ones(dims[m][0]) if present else torch.zeros(dims[m][0])), dtype=torch.bool)
+        if m == "A" and heterogeneous:
+            mask = element_mask.any(-1) & present
         if tuple(x.shape) != dims[m] or not torch.isfinite(x).all() or mask.shape != dims[m][:1]:
             raise ValueError(f"{key}: invalid shape, mask, or nonfinite values")
         if present and not mask.any():
@@ -39,6 +55,22 @@ def prepare_record(record, cfg):
         out[m] = x
         out["valid"][m] = mask
         out["present"][m] = torch.tensor(present)
+    if getattr(cfg, "action_representation", "continuous") == "x_tokenizer":
+        dm = torch.as_tensor(record.get("codec_dof_mask", torch.ones(dims["A"], dtype=torch.bool)))
+        if dm.dtype != torch.bool or dm.shape != dims["A"] or not dm.any():
+            raise ValueError("codec_dof_mask must be bool [H,native_dim]")
+        out["codec_dof_mask"] = dm
+        rid = record.get("codec_robot_type_id", cfg.x_tokenizer_robot_type_id)
+        if not isinstance(rid, int) or rid < 0:
+            raise ValueError("codec_robot_type_id must be a nonnegative integer")
+        out["codec_robot_type_ids"] = torch.tensor(rid, dtype=torch.long)
+        if cfg.x_tokenizer_use_anchor:
+            obs = torch.as_tensor(record["codec_obs_state"], dtype=torch.float32)
+            if obs.shape != (1, cfg.action_dim) or not torch.isfinite(obs).all():
+                raise ValueError("codec_obs_state must be normalized finite [1,native_dim]")
+            out["codec_obs_state"] = obs
+        elif "codec_obs_state" in record:
+            raise ValueError("codec_obs_state requires x_tokenizer_use_anchor=true")
     goal = record.get("goal_vision")
     out["goal_present"] = torch.tensor(goal is not None)
     out["goal_vision"] = torch.zeros(dims["V"]) if goal is None else torch.as_tensor(goal, dtype=torch.float32)

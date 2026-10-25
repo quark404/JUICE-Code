@@ -59,6 +59,15 @@ class TrainConfig:
     action_horizon: int = 16
     action_adapter: str = "continuous"
     action_hidden_dim: int = 256
+    init_backbone_only: bool = False  # explicitly discard Action weights when migrating layouts
+    action_representation: str = "continuous"  # continuous | x_tokenizer (frozen Q(E(A)))
+    x_tokenizer_checkpoint: str | None = None
+    x_tokenizer_latent_scale: float = 1.0
+    x_tokenizer_use_anchor: bool = False
+    x_tokenizer_robot_type_id: int = 0  # checkpoint registry: Unknown=0; explicit override per record
+    action_mode: str = "fixed"
+    action_fields: list[str] = field(default_factory=list)
+    action_layouts: dict[str, list[str]] = field(default_factory=dict)
     action_noise_scale: float = 1.0
     lambda_action: float = 1.0
     vla_tasks: dict[str, float] = field(default_factory=lambda: {"action_policy": 1.0})
@@ -86,6 +95,18 @@ class TrainConfig:
     save_keep: int = 3
 
     def __post_init__(self) -> None:
+        from juice.action_schema import validate_action_mode
+        validate_action_mode(self)
+        if self.action_representation not in ("continuous", "x_tokenizer"):
+            raise ValueError("unknown action_representation")
+        if self.action_representation == "x_tokenizer":
+            import math
+            if self.action_mode != "fixed" or self.action_dim <= 0:
+                raise ValueError("frozen X-Tokenizer uses its native fixed layout; do not apply raw schema masks to latents")
+            if not self.x_tokenizer_checkpoint or not math.isfinite(self.x_tokenizer_latent_scale) or self.x_tokenizer_latent_scale <= 0:
+                raise ValueError("frozen codec needs checkpoint and positive finite latent scale")
+            if self.x_tokenizer_robot_type_id < 0:
+                raise ValueError("invalid X-Tokenizer robot type ID")
         if self.action_dim < 0 or self.action_horizon <= 0 or self.action_hidden_dim <= 0:
             raise ValueError("invalid action dimensions")
         if self.action_adapter not in ("continuous", "mlp"):

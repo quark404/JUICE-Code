@@ -33,6 +33,14 @@ def validate_tasks(tasks):
 
 def vla_flow_loss(model, enc, cfg):
     states = {m: enc[m].float() for m in "VLA"}
+    heterogeneous = getattr(cfg, "action_mode", "fixed") == "heterogeneous"
+    action_kwargs = {}
+    if heterogeneous:
+        dim_mask = enc["action_dim_mask"]
+        action_kwargs = {"action_dim_mask": dim_mask, "action_layout_ids": enc["action_layout_ids"]}
+        states["A"] = torch.where(dim_mask, states["A"], torch.zeros_like(states["A"]))
+    if "action_codec_mask" in enc:
+        action_kwargs.update(action_codec_mask=enc["action_codec_mask"], action_codec_ids=enc["action_codec_ids"])
     b, device = states["A"].shape[0], states["A"].device
     tasks = list(cfg.vla_tasks)
     def available(task, modality):
@@ -69,17 +77,29 @@ def vla_flow_loss(model, enc, cfg):
         scale = {"V": cfg.noise_scale, "L": cfg.text_noise_scale, "A": cfg.action_noise_scale}[m]
         z = times[m][..., None] * x + (1 - times[m][..., None]) * torch.randn_like(x) * scale
         noisy[m] = torch.where(visible[m][..., None], z, torch.zeros_like(z))
+        if m == "A" and heterogeneous:
+            noisy[m] = torch.where(dim_mask, noisy[m], torch.zeros_like(noisy[m]))
+            visible[m] &= dim_mask.any(-1)
     use_instruction = torch.tensor([TASKS[t][2] for t in tasks], device=device)[choices, None]
     instruction_mask = enc["instruction_mask"] & use_instruction
     prediction = model(noisy["V"], times["V"], noisy["L"], times["L"], txt_key_mask=visible["L"],
         action=noisy["A"], t_action=times["A"], image_key_mask=visible["V"], action_key_mask=visible["A"],
         image_condition=enc["current_vision"], language_condition=enc["instruction"],
-        image_condition_mask=enc["current_vision_mask"], language_condition_mask=instruction_mask, objective=objective)
+        image_condition_mask=enc["current_vision_mask"], language_condition_mask=instruction_mask, objective=objective, **action_kwargs)
     loss, metrics = 0., {}
     for m, pred in zip("VLA", prediction):
-        error = ((pred - states[m]) / (1 - times[m][..., None]).clamp_min(T_EPS)).square().mean(-1)
+        delta = (pred - states[m]) / (1 - times[m][..., None]).clamp_min(T_EPS)
         weight = active[m].float()
-        value = (error * weight).sum() / weight.sum().clamp_min(1)
+        if m == "A" and heterogeneous:
+            elements = dim_mask & active[m][..., None]
+            error = torch.where(elements, delta, torch.zeros_like(delta)).square()
+            counts = elements.sum((1, 2))
+            per_row = error.sum((1, 2)) / counts.clamp_min(1)
+            value = per_row.sum() / (counts > 0).sum().clamp_min(1)
+            metrics["active_A_elements"] = counts.sum().detach()
+        else:
+            error = delta.square().mean(-1)
+            value = (error * weight).sum() / weight.sum().clamp_min(1)
         loss = loss + {"V": cfg.lambda_img, "L": cfg.lambda_txt, "A": cfg.lambda_action}[m] * value
         metrics[f"loss_{m}"] = value.detach()
         metrics[f"active_{m}"] = weight.sum().detach()

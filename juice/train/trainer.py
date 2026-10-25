@@ -44,9 +44,15 @@ def update_ema(ema: torch.nn.Module, model: torch.nn.Module, decay: float) -> No
     torch._foreach_add_(ema_params, [p.detach() for p in model.parameters()], alpha=1.0 - decay)
 
 
-def build_model(cfg: TrainConfig) -> MMRiT:
+def build_model(cfg: TrainConfig, action_codec=None) -> MMRiT:
+    if cfg.action_representation != "x_tokenizer" and action_codec is not None:
+        raise ValueError("action codec supplied to a continuous-action model")
+    if cfg.action_representation == "x_tokenizer" and action_codec is None:
+        raise ValueError("build_model requires the frozen codec to resolve its latent dimensions")
     return MMRiT(MMRiTConfig(image_latent_dim=IMAGE_SPACES[cfg.image_space].latent_dim,
-        action_dim=cfg.action_dim, action_adapter=cfg.action_adapter, action_hidden_dim=cfg.action_hidden_dim))
+        action_dim=action_codec.latent_dim if action_codec else cfg.action_dim, action_adapter=cfg.action_adapter, action_hidden_dim=cfg.action_hidden_dim,
+        action_mode=cfg.action_mode, action_fields=cfg.action_fields, action_layouts=cfg.action_layouts,
+        action_representation=cfg.action_representation, action_codec=action_codec.metadata if action_codec else {}))
 
 
 def load_weights(path: str | Path) -> dict[str, torch.Tensor]:
@@ -59,6 +65,17 @@ def load_weights(path: str | Path) -> dict[str, torch.Tensor]:
 
         return load_file(str(path))
     return torch.load(path, map_location="cpu", weights_only=True, mmap=True)["model"]
+
+
+def load_backbone_weights(model, weights):
+    """Reuse V/L backbone while deliberately reinitializing schema-specific Action weights."""
+    def action_key(key):
+        return key.startswith(("action.", "act_", "codec_")) or ".act_" in key
+    selected = {k: v for k, v in weights.items() if not action_key(k)}
+    missing, unexpected = model.load_state_dict(selected, strict=False)
+    allowed = lambda k: action_key(k) or k.startswith(("visual_role.", "language_role.", "objective_embed."))
+    if unexpected or any(not allowed(k) for k in missing):
+        raise ValueError(f"incompatible backbone: missing={missing}, unexpected={unexpected}")
 
 
 @torch.no_grad()
@@ -139,15 +156,26 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
     if not cfg.action_dim:
         text_encoder = T5TextEncoder().to(device)
         image_encoder = build_image_encoder(cfg.image_space).to(device)
-    model = build_model(cfg).to(device)
+    action_codec = None
+    if cfg.action_representation == "x_tokenizer":
+        from juice.action_codec import FrozenXTokenizer
+        action_codec = FrozenXTokenizer.from_config(cfg, device)
+    model = build_model(cfg, action_codec).to(device)
     start_step, opt_state = 0, None
     if resume:
         payload = torch.load(resume, map_location="cpu", weights_only=True, mmap=True)
+        from juice.action_schema import check_action_checkpoint
+        check_action_checkpoint(model.cfg, payload.get("architecture", {}))
         model.load_state_dict(payload["model"], strict=True)
         start_step, opt_state = int(payload["step"]), payload["optimizer"]
     elif cfg.init_from:
+        if (cfg.action_mode == "heterogeneous" or cfg.action_representation == "x_tokenizer") and not cfg.init_backbone_only:
+            raise ValueError("use resume for a matching heterogeneous checkpoint, or init_backbone_only=true for explicit migration")
         weights = load_weights(cfg.init_from)
-        if cfg.action_dim:
+        if cfg.init_backbone_only:
+            model.init_weights()
+            load_backbone_weights(model, weights)
+        elif cfg.action_dim:
             model.init_weights()
             missing, unexpected = model.load_state_dict(weights, strict=False)
             allowed = lambda k: k.startswith(("action.", "act_", "visual_role.", "language_role.", "objective_embed.")) or ".act_" in k
@@ -198,6 +226,8 @@ def train(cfg: TrainConfig, resume: str | None = None, max_steps: int | None = N
                 def move(x):
                     return {k: move(v) for k, v in x.items()} if isinstance(x, dict) else x.to(device)
                 enc = move(batch)
+                if action_codec is not None:
+                    enc = action_codec.encode_batch(enc)
             else:
                 enc = encode_micro_batch(batch, device, image_encoder, text_encoder, cfg.img_known_inpaint)
             last = accum == cfg.grad_accum_steps - 1

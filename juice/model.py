@@ -26,7 +26,7 @@ exported weights without a key map.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -59,6 +59,11 @@ class MMRiTConfig:
     action_dim: int = 0              # 0 preserves the original two-stream architecture
     action_adapter: str = "continuous"  # continuous (linear) | mlp
     action_hidden_dim: int = 256
+    action_representation: str = "continuous"
+    action_codec: dict = field(default_factory=dict)  # frozen codec fingerprint and interface
+    action_mode: str = "fixed"
+    action_fields: list[str] = field(default_factory=list)
+    action_layouts: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -274,6 +279,8 @@ class MMRiT(nn.Module):
         super().__init__()
         if cfg.action_dim < 0 or (cfg.action_dim and not cfg.token_time):
             raise ValueError("Action models require action_dim > 0 and token_time=True")
+        from juice.action_schema import validate_action_mode
+        validate_action_mode(cfg)
         self.cfg = cfg
         h = cfg.hidden_size
         self.latent_in = nn.Linear(cfg.image_latent_dim, h)
@@ -295,7 +302,15 @@ class MMRiT(nn.Module):
         self.txt_final = nn.Linear(h, cfg.text_dim)
         if cfg.action_dim:
             from juice.action import ActionAdapter
-            self.action = ActionAdapter(cfg.action_dim, h, cfg.action_adapter, cfg.action_hidden_dim)
+            if cfg.action_mode == "heterogeneous":
+                from juice.action_schema import HeterogeneousActionAdapter
+                self.action = HeterogeneousActionAdapter(cfg.action_dim, h, cfg.action_adapter,
+                    cfg.action_hidden_dim, cfg.action_fields, cfg.action_layouts)
+            else:
+                self.action = ActionAdapter(cfg.action_dim, h, cfg.action_adapter, cfg.action_hidden_dim)
+            if cfg.action_representation == "x_tokenizer":
+                self.codec_mask_projection = nn.Linear(cfg.action_codec["raw_dim"], h, bias=False)
+                self.codec_robot_embedding = nn.Embedding(cfg.action_codec["max_robot_types"], h)
             self.objective_embed = nn.Embedding(12, h)
             self.visual_role = nn.Embedding(2, h)
             self.language_role = nn.Embedding(2, h)
@@ -353,6 +368,8 @@ class MMRiT(nn.Module):
         image_condition: torch.Tensor | None = None, language_condition: torch.Tensor | None = None,
         image_condition_mask: torch.Tensor | None = None, language_condition_mask: torch.Tensor | None = None,
         objective: torch.Tensor | None = None,
+        action_dim_mask: torch.Tensor | None = None, action_layout_ids: torch.Tensor | None = None,
+        action_codec_mask: torch.Tensor | None = None, action_codec_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Predict clean states; Action-enabled models return (vision, language, action).
 
@@ -431,7 +448,26 @@ class MMRiT(nn.Module):
         txt_tokens = torch.cat([txt_tokens, img_time.expand(b, -1, -1), txt_time.expand(b, -1, -1)], dim=1)
         act_tokens = None
         if action is not None:
-            act_tokens = self.action.encode(action)
+            if self.cfg.action_mode == "heterogeneous":
+                act_tokens = self.action.encode(action, action_dim_mask, action_layout_ids)
+                effective_keys = action_dim_mask.any(-1)
+                action_key_mask = effective_keys if action_key_mask is None else action_key_mask & effective_keys
+            else:
+                if action_dim_mask is not None or action_layout_ids is not None:
+                    raise ValueError("per-dimension masks require action_mode=heterogeneous")
+                act_tokens = self.action.encode(action)
+            if self.cfg.action_representation == "x_tokenizer":
+                if (action_codec_mask is None or action_codec_mask.dtype != torch.bool
+                        or action_codec_mask.shape != (b, self.cfg.action_codec["raw_dim"])
+                        or action_codec_ids is None or action_codec_ids.dtype != torch.long
+                        or action_codec_ids.shape != (b,)):
+                    raise ValueError("codec latents require native field mask and robot IDs")
+                if bool(((action_codec_ids < 0) | (action_codec_ids >= self.cfg.action_codec["max_robot_types"])).any()):
+                    raise ValueError("codec robot ID out of range")
+                act_tokens = act_tokens + (self.codec_mask_projection(action_codec_mask.to(act_tokens.dtype))
+                    + self.codec_robot_embedding(action_codec_ids))[:, None]
+            elif action_codec_mask is not None or action_codec_ids is not None:
+                raise ValueError("codec context requires action_representation=x_tokenizer")
             ta = t_action[:, None].expand(-1, action.shape[1]) if t_action.ndim == 1 else t_action
             act_tokens = act_tokens + self.act_tok_t_proj(
                 self.act_t_embed(ta.reshape(-1)).view(b, action.shape[1], -1)).to(act_tokens.dtype)
@@ -460,5 +496,7 @@ class MMRiT(nn.Module):
         img_x0 = self.final(self.final_norm(img_tokens[:, n_img_cond:])).float()
         txt_x0 = self.txt_final(self.txt_final_norm(txt_tokens[:, n_txt_cond:n_txt])).float()
         if action is not None:
-            return img_x0, txt_x0, self.action.decode(act_tokens).float()
+            act_x0 = (self.action.decode(act_tokens, action_dim_mask) if self.cfg.action_mode == "heterogeneous"
+                      else self.action.decode(act_tokens))
+            return img_x0, txt_x0, act_x0.float()
         return img_x0, txt_x0

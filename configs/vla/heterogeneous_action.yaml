@@ -1,0 +1,27 @@
+# Optional branch; all existing configs continue using action_mode: fixed.
+run_name: heterogeneous_single_dual_action
+train_manifests: [data/robot/heterogeneous_train.txt]
+train_manifest_counts: [1000]  # actual number of windows, not an action dimension
+image_space: siglip2
+action_mode: heterogeneous
+action_dim: 14              # canonical width; per-record native width is 7 or 14
+action_horizon: 16
+action_adapter: continuous  # mlp is also supported
+# Fields must already share units, frames, rotation conventions and control rate.
+action_fields: [left_dx, left_dy, left_dz, left_rx, left_ry, left_rz, left_gripper,
+                right_dx, right_dy, right_dz, right_rx, right_ry, right_rz, right_gripper]
+action_layouts:
+  single_left: [left_dx, left_dy, left_dz, left_rx, left_ry, left_rz, left_gripper]
+  dual_arm: [left_dx, left_dy, left_dz, left_rx, left_ry, left_rz, left_gripper,
+             right_dx, right_dy, right_dz, right_rx, right_ry, right_rz, right_gripper]
+vla_tasks: {action_policy: 1.0}
+# To transfer V/L weights from a fixed-width VLA/JUICE checkpoint:
+# init_from: /path/to/model_or_checkpoint
+# init_backbone_only: true  # explicitly reinitialize Action weights for this schema
+num_workers: 0
+batch_size: 8
+micro_batch_size: 2
+grad_accum_steps: 4
+num_steps: 10000
+warmup_steps: 500
+compile_model: false

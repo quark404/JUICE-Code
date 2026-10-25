@@ -48,6 +48,26 @@ python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
 
 视觉与语言归一化遵循原 JUICE。Action 的 lower/upper、坐标系、字段顺序和频率必须保存并在部署时复用；`juice.action.ActionNormalizer` 支持稳健界限缩放和反变换。先按轨迹划分数据，再生成完整窗口，避免相邻窗口泄漏。缺失目标的样本只参与标签齐备的任务；无可用任务时报错。
 
+### 可选异构 Action 分支
+
+默认 `action_mode: fixed` 保持原有固定动作维度。新增 `action_mode: heterogeneous`：按显式字段布局将不同机器人的 `[H,d_i]` 动作映射到统一 `[H,D]`，同一 batch 可以混合不同原生维度。Mask/Layout embedding 提供有效字段与布局身份，逐维 Mask 贯穿加噪、Joint Attention、损失与 Euler 采样；不增加机器人 State 输入。
+
+```bash
+python -m scripts.train.train --config configs/vla/heterogeneous_action.yaml
+```
+
+配置中的 `action_fields` 是公共标量字段顺序，`action_layouts` 注册各布局的原生字段顺序，`action_dim` 等于公共字段数。缓存记录增加 `action_layout`，可选 `action_dim_mask`（原生 `[d_i]` 或 `[H,d_i]` bool）。推理输出用 `ActionSchema.unpack` 取回对应原生维度，再按该数据源统计反归一化。
+
+异构动作损失先对每个样本有效元素平均，再在样本间平均，避免高维机器人获得额外权重。Resume 检查完整字段布局；迁移布局时使用 `init_from` + `init_backbone_only: true` 显式重置 Action 参数。字段语义、单位、坐标系和控制频率仍需上游对齐，不能只按维数补零。详见 [异构 Action 设计与接口](docs/native_joint_flow_vla/docs/12_heterogeneous_actions.md)。
+
+### 可选冻结 X-Tokenizer 编解码
+
+`action_representation: x_tokenizer` 使用冻结的 `E→SRQ` 产生 `quantized_features`，在该 latent 上训练 JUICE Flow，再通过冻结 Decoder 还原连续动作。Tokenizer 全部参数冻结，不加入优化器；JUICE 自身仍需训练。原 fixed/heterogeneous continuous 模式保持可选。
+
+它是本项目的 latent Flow 实验，不是 X-Tokenizer 论文中的离散 token 辅助监督算法。默认不传 anchor，但预训练模型在无 anchor 时的重建质量必须先测量；未做真实权重/机器人效果验证。示例配置、归一化约定、混合 robot ID/DOF Mask、重建检查及推理接口见 [冻结 X-Tokenizer 使用说明](docs/native_joint_flow_vla/docs/14_frozen_x_tokenizer.md)。
+
+异构设计的依据及本项目与论文的差异见 [π0.5 / Dynin / X-Tokenizer 官方实现对照](docs/native_joint_flow_vla/docs/13_action_references.md)。其中 π0.5 的具体 padding 行为来自固定版本 OpenPI 源码，不把逐维 Mask Loss 误称为其论文实现。
+
 ### 目标与采样
 
 `vla_tasks` 支持 `action_policy`、`world_model`、`goal_prediction`、`task_understanding`、`language_planning`、`inverse_dynamics`、`plan_conditioned_action`、`goal_conditioned_action`、`joint_va`、`joint_la`、`joint_lv`、`joint_lva`。默认只训练 Action；四任务与三目标训练需分别评估。
@@ -55,7 +75,7 @@ python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
 `juice.vla_sampling.sample_vla(model.eval(), batch, task="action_policy")` 返回归一化 V/L/A 状态，目标从新噪声开始，条件保持干净。`batch` 是缓存 DataLoader 输出，须先移动到模型设备。Action 反归一化、机器人控制、像素/文字解码需由外部接口完成；原 `JuicePipeline` 不提供机器人控制 API。
 
 ```bash
-python -m unittest tests.test_vla tests.test_vla_data
+python -m unittest tests.test_vla tests.test_vla_data tests.test_heterogeneous_action tests.test_action_codec
 ```
 
 [修订后的设计文档](docs/native_joint_flow_vla/README.md) 记录任务矩阵、论文差异、数据约束、实现状态和后续评估。以下为原 JUICE 使用说明。
