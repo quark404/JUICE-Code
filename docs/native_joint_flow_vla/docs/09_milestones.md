@@ -5,3 +5,5 @@
 尚待实际机器人数据验证：原始轨迹转换/时间对齐工具；B1 Action Policy 训练和闭环评估；WM/Language 单目标训练；VA/LA/LVA Joint 实验；语言/视觉解码与完整控制服务。
 
 论文四任务方向已核对；训练目标/噪声/损失采用 JUICE 连续 Flow，不能称为 Dynin 离散实现的复现。先完成可比较的 Action-only 基线，再评估辅助目标的实际收益。
+
+当前第一版默认入口已选择padded direct-action，参考OpenPI的32D模型宽度/原生维度截取。异构字段Mask与X-Tokenizer为可选实验，不是第一版前置依赖。见 [V1接口与7D分析](15_v1_direct_actions_and_7d.md)。

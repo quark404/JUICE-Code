@@ -17,6 +17,22 @@ def prepare_record(record, cfg):
             "L": (cfg.text_canvas, 512), "A": (cfg.action_horizon, cfg.action_dim)}
     out = {}
     heterogeneous = getattr(cfg, "action_mode", "fixed") == "heterogeneous"
+    padded = getattr(cfg, "action_mode", "fixed") == "padded"
+    padded_action = None
+    if padded:
+        from juice.action import pad_actions
+        raw_action = record.get("action")
+        raw_action = None if raw_action is None else torch.as_tensor(raw_action, dtype=torch.float32)
+        if raw_action is not None and (raw_action.ndim != 2 or raw_action.shape[0] != cfg.action_horizon):
+            raise ValueError("padded action must have native shape [H,d_i]")
+        native = record.get("action_native_dim", raw_action.shape[-1] if raw_action is not None
+                            else getattr(cfg, "action_native_dim", None))
+        if type(native) is not int or not 0 < native <= cfg.action_dim:
+            raise ValueError("padded records need a native width within model action_dim")
+        if raw_action is not None and raw_action.shape[-1] != native:
+            raise ValueError("action_native_dim does not match native action tensor")
+        padded_action = torch.zeros(dims["A"]) if raw_action is None else pad_actions(raw_action, cfg.action_dim)
+        out["action_native_dims"] = torch.tensor(native, dtype=torch.long)
     packed_action = element_mask = None
     if heterogeneous:
         from juice.action_schema import ActionSchema
@@ -45,6 +61,8 @@ def prepare_record(record, cfg):
         x = torch.as_tensor(record[key], dtype=torch.float32) if present else torch.zeros(dims[m])
         if m == "A" and heterogeneous:
             x = packed_action
+        elif m == "A" and padded:
+            x = padded_action
         mask = torch.as_tensor(record.get(f"{key}_mask", torch.ones(dims[m][0]) if present else torch.zeros(dims[m][0])), dtype=torch.bool)
         if m == "A" and heterogeneous:
             mask = element_mask.any(-1) & present

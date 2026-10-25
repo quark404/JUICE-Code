@@ -69,7 +69,11 @@ def sample_vla(model, enc, task="action_policy", steps=25, generator=None, noise
     if action_codec is None:
         if representation == "x_tokenizer":
             raise ValueError("sample_vla requires the matching frozen action_codec")
-        return _sample_states(model, enc, task, steps, generator, noise_scales)
+        result = _sample_states(model, enc, task, steps, generator, noise_scales)
+        if getattr(model.cfg, "action_mode", "fixed") == "padded":
+            from juice.action import unpad_actions
+            result["A_native"] = unpad_actions(result["A"], enc["action_native_dims"])
+        return result
     if representation != "x_tokenizer" or model.cfg.action_codec != action_codec.metadata:
         raise ValueError("model and action codec metadata do not match")
     if task not in TASKS:

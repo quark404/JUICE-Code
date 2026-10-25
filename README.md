@@ -20,14 +20,18 @@ This repository holds the code for inference, evaluation, training (all stages) 
 
 本分支在原 JUICE 图文模型上增加可选 **Action 第三流**。当前视觉 `I_t` 和任务指令 `L_inst` 为条件；Future Vision、Language Plan、Action 为可选目标。**没有机器人 State/proprioception/sensor 输入。** 当前视觉与未来视觉、Instruction 与 Plan 分开编码，避免标签泄漏。
 
-默认 Baseline 直接对归一化 `A ∈ R^(H×d_a)` 做连续 Flow；`action_adapter: continuous` 只用 Linear 连接主干维度，无量化、无 Action Tokenizer。可选 `mlp` 改变输入/输出投影，损失仍在相同连续动作坐标计算。
+**第一版采用参考 OpenPI/π0.5 的直接连续动作处理**：归一化原生动作 `[H,d_i]` 在尾部补零为 `[H,32]`，Flow 直接处理动作值，再通过 Linear 输出连续动作。默认不使用 X-Tokenizer、RVQ、离散 token 或 Action latent 编解码器；仍保持无 State 的 JUICE 三流架构。
+
+默认配置为 `action_mode: padded`、`action_representation: continuous`、`action_dim: 32`。32是模型宽度，不是机器人自由度；原生7D、8D、14D等可补齐到该宽度。预测时截回原生维度。padding 通道也加噪并参与原有维度平均损失，clean target 为零，未启用异构分支的逐维Mask损失。`action_adapter: continuous` 只作Linear维度连接，可选mlp也仍直接监督连续动作。
+
+这借鉴的是官方动作padding/输出截取机制，不是复现完整π0.5，也**不会自动把不同机器人转换为7D末端动作**。详见 [V1接口与7D转换分析](docs/native_joint_flow_vla/docs/15_v1_direct_actions_and_7d.md)。
 
 参考 [Dynin-Robotics](https://arxiv.org/abs/2609.13053) 的 **Policy / World Modeling / Goal Prediction / Task Understanding** 条件与目标布局，并加入 objective embedding。Dynin 原文使用均匀量化动作与离散 masked diffusion；本实现是 **JUICE 连续 Flow 适配，不是离散算法复现**。论文的 Action–WM 联合去噪为推理组合；本仓库可选的 Joint VA/LA/LVA 监督训练是额外实验。
 
 ### 训练
 
 ```bash
-# 先准备 frozen-feature .pt 窗口文件及 manifest，并按真实机器人修改 action_dim/H/count。
+# 第一版：准备V/L特征缓存和原生连续动作；模型宽度32，按真实数据修改H/count。
 python -m scripts.train.train --config configs/vla/action_baseline.yaml
 # 可选：混合论文四种任务方向；示例权重不是论文 schedule 或 loss 系数。
 python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
@@ -41,7 +45,8 @@ python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
 |---|---|
 | current_vision | `[256,D_v]` 当前视觉，D_v=1152 或 1024 |
 | instruction / instruction_mask | `[text_canvas,512]` / `[text_canvas]`，独立编码的指令及内容+EOS mask |
-| action | `[action_horizon,action_dim]`，按训练集统计归一化到 [-1,1] |
+| action | V1保存原生 `[action_horizon,d_i]`，`d_i≤32`；按训练集统计归一化，DataLoader负责补齐 |
+| action_native_dim | 可选原生宽度；有标签时自动推断，无标签推理时须指定或使用配置回退值 |
 | future_vision | 可选 `[256,D_v]`，下一观测/窗口末端，不能与终点目标混用 |
 | goal_vision | 可选 `[256,D_v]`，任务/子任务终点 |
 | language_plan / language_plan_mask | 可选 `[text_canvas,512]` / `[text_canvas]`，独立编码的计划 |
@@ -50,7 +55,7 @@ python -m scripts.train.train --config configs/vla/dynin_objectives.yaml
 
 ### 可选异构 Action 分支
 
-默认 `action_mode: fixed` 保持原有固定动作维度。新增 `action_mode: heterogeneous`：按显式字段布局将不同机器人的 `[H,d_i]` 动作映射到统一 `[H,D]`，同一 batch 可以混合不同原生维度。Mask/Layout embedding 提供有效字段与布局身份，逐维 Mask 贯穿加噪、Joint Attention、损失与 Euler 采样；不增加机器人 State 输入。
+原有 `action_mode: fixed` 严格固定维度接口继续保留；第一版默认使用上述 padded 模式。可选 `action_mode: heterogeneous`：按显式字段布局将不同机器人的 `[H,d_i]` 动作映射到统一 `[H,D]`，同一 batch 可以混合不同原生维度。Mask/Layout embedding 提供有效字段与布局身份，逐维 Mask 贯穿加噪、Joint Attention、损失与 Euler 采样；不增加机器人 State 输入。
 
 ```bash
 python -m scripts.train.train --config configs/vla/heterogeneous_action.yaml
@@ -60,9 +65,9 @@ python -m scripts.train.train --config configs/vla/heterogeneous_action.yaml
 
 异构动作损失先对每个样本有效元素平均，再在样本间平均，避免高维机器人获得额外权重。Resume 检查完整字段布局；迁移布局时使用 `init_from` + `init_backbone_only: true` 显式重置 Action 参数。字段语义、单位、坐标系和控制频率仍需上游对齐，不能只按维数补零。详见 [异构 Action 设计与接口](docs/native_joint_flow_vla/docs/12_heterogeneous_actions.md)。
 
-### 可选冻结 X-Tokenizer 编解码
+### 后续实验：冻结 X-Tokenizer 编解码
 
-`action_representation: x_tokenizer` 使用冻结的 `E→SRQ` 产生 `quantized_features`，在该 latent 上训练 JUICE Flow，再通过冻结 Decoder 还原连续动作。Tokenizer 全部参数冻结，不加入优化器；JUICE 自身仍需训练。原 fixed/heterogeneous continuous 模式保持可选。
+该分支不属于第一版主线；只有显式设置 `action_representation: x_tokenizer` 才使用冻结的 `E→SRQ` 产生 `quantized_features`，在该 latent 上训练 JUICE Flow，再通过冻结 Decoder 还原连续动作。Tokenizer 全部参数冻结，不加入优化器；JUICE 自身仍需训练。原 fixed/heterogeneous continuous 模式保持可选。
 
 它是本项目的 latent Flow 实验，不是 X-Tokenizer 论文中的离散 token 辅助监督算法。默认不传 anchor，但预训练模型在无 anchor 时的重建质量必须先测量；未做真实权重/机器人效果验证。示例配置、归一化约定、混合 robot ID/DOF Mask、重建检查及推理接口见 [冻结 X-Tokenizer 使用说明](docs/native_joint_flow_vla/docs/14_frozen_x_tokenizer.md)。
 
@@ -72,10 +77,10 @@ python -m scripts.train.train --config configs/vla/heterogeneous_action.yaml
 
 `vla_tasks` 支持 `action_policy`、`world_model`、`goal_prediction`、`task_understanding`、`language_planning`、`inverse_dynamics`、`plan_conditioned_action`、`goal_conditioned_action`、`joint_va`、`joint_la`、`joint_lv`、`joint_lva`。默认只训练 Action；四任务与三目标训练需分别评估。
 
-`juice.vla_sampling.sample_vla(model.eval(), batch, task="action_policy")` 返回归一化 V/L/A 状态，目标从新噪声开始，条件保持干净。`batch` 是缓存 DataLoader 输出，须先移动到模型设备。Action 反归一化、机器人控制、像素/文字解码需由外部接口完成；原 `JuicePipeline` 不提供机器人控制 API。
+`juice.vla_sampling.sample_vla(model.eval(), batch, task="action_policy")` 在 padded 模式返回模型宽度的 `A` 和逐样本截回原生宽度的 `A_native` 列表。反归一化与控制使用 `A_native`。该接口返回归一化 V/L/A 状态，目标从新噪声开始，条件保持干净。`batch` 是缓存 DataLoader 输出，须先移动到模型设备。Action 反归一化、机器人控制、像素/文字解码需由外部接口完成；原 `JuicePipeline` 不提供机器人控制 API。
 
 ```bash
-python -m unittest tests.test_vla tests.test_vla_data tests.test_heterogeneous_action tests.test_action_codec
+python -m unittest tests.test_vla tests.test_vla_data tests.test_heterogeneous_action tests.test_action_codec tests.test_padded_action
 ```
 
 [修订后的设计文档](docs/native_joint_flow_vla/README.md) 记录任务矩阵、论文差异、数据约束、实现状态和后续评估。以下为原 JUICE 使用说明。

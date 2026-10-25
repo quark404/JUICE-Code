@@ -38,11 +38,12 @@
 
 借鉴范围：显式标准字段、缺失维度屏蔽、机器人身份上下文。论文 anchor 的依赖和官方 API 的可选 obs_state 不等价于已验证无 anchor 的重建能力。
 
-## 本项目的三种路径
+## 本项目的路径
 
 | 路径 | 模型 A 空间 | 维度统一方式 | 依据/边界 |
 |---|---|---|---|
-| 默认 fixed continuous | 归一化原生连续动作 | 同一模型固定 action_dim | 原有 baseline 保留 |
+| V1 padded continuous | 原生连续动作尾部补齐到32D | padding后直接Flow，输出截回原生宽度 | OpenPI式动作接口，不强制7D转换 |
+| 现有 fixed continuous | 归一化原生连续动作 | 同一模型固定 action_dim | 原有 baseline 保留 |
 | heterogeneous continuous | 公共字段连续动作 | 原生字段→canonical schema，逐维 Mask，layout embedding | 参考标准布局/padding，Mask loss 是本项目设计 |
 | frozen X-Tokenizer | 冻结 Q(E(A)) 的 latent | 上游先组织成 checkpoint 26D，再用 DOF Mask 与预训练 robot ID | 冻结模块调用有源码依据；latent Flow 效果尚待实验 |
 

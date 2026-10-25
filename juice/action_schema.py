@@ -75,8 +75,12 @@ def validate_action_mode(cfg):
     mode = getattr(cfg, "action_mode", "fixed")
     fields = getattr(cfg, "action_fields", [])
     layouts = getattr(cfg, "action_layouts", {})
-    if mode not in ("fixed", "heterogeneous"):
-        raise ValueError("action_mode must be fixed or heterogeneous")
+    if mode not in ("fixed", "padded", "heterogeneous"):
+        raise ValueError("action_mode must be fixed, padded or heterogeneous")
+    if mode == "padded":
+        native = getattr(cfg, "action_native_dim", None)
+        if cfg.action_dim <= 0 or (native is not None and (type(native) is not int or not 0 < native <= cfg.action_dim)):
+            raise ValueError("padded mode requires a positive model width and a valid optional action_native_dim")
     if mode == "heterogeneous":
         schema = ActionSchema(fields, layouts)
         if cfg.action_dim != len(schema.fields):

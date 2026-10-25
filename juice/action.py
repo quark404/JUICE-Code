@@ -61,3 +61,21 @@ class ActionNormalizer:
     def denormalize(self, z):
         lower, upper = self._bounds(z)
         return lower + (z.clamp(-1, 1) + 1) * .5 * (upper - lower)
+
+
+def pad_actions(actions, model_dim):
+    """OpenPI-style trailing zero padding; does not change native action semantics."""
+    import torch.nn.functional as F
+    if actions.ndim < 2 or not 0 < actions.shape[-1] <= model_dim:
+        raise ValueError("native action width must be positive and <= model action_dim")
+    return F.pad(actions, (0, model_dim - actions.shape[-1]))
+
+
+def unpad_actions(actions, native_dims):
+    """Return a list of per-sample native action tensors (widths may differ)."""
+    import torch
+    dims = torch.as_tensor(native_dims)
+    if (actions.ndim != 3 or dims.shape != (actions.shape[0],) or dims.dtype != torch.long
+            or bool(((dims <= 0) | (dims > actions.shape[-1])).any())):
+        raise ValueError("native_dims must be long [B] with widths within model action_dim")
+    return [action[..., :width] for action, width in zip(actions, dims.tolist())]

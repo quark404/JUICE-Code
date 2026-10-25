@@ -65,6 +65,7 @@ class TrainConfig:
     x_tokenizer_latent_scale: float = 1.0
     x_tokenizer_use_anchor: bool = False
     x_tokenizer_robot_type_id: int = 0  # checkpoint registry: Unknown=0; explicit override per record
+    action_native_dim: int | None = None  # padded mode fallback for unlabeled inference records
     action_mode: str = "fixed"
     action_fields: list[str] = field(default_factory=list)
     action_layouts: dict[str, list[str]] = field(default_factory=dict)

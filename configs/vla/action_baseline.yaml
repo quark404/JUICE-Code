@@ -1,9 +1,13 @@
-# Frozen-feature manifests: one .pt dictionary per trajectory window.
+# V1: OpenPI/pi0.5-style width padding, direct continuous actions; no tokenizer.
+# Frozen V/L feature manifests: one .pt dictionary per trajectory window.
 run_name: action_continuous_baseline
 train_manifests: [data/robot/train.txt]
 train_manifest_counts: [1000]  # replace with the actual number of training windows
 image_space: siglip2
-action_dim: 7                # example layout; MUST match your robot's controls
+action_mode: padded
+action_representation: continuous
+action_dim: 32              # model width, following the OpenPI default
+action_native_dim: 7        # example fallback for unlabeled records; not a 7D conversion
 action_horizon: 16
 action_adapter: continuous  # linear backbone boundary; no learned Action tokenizer
 vla_tasks: {action_policy: 1.0}

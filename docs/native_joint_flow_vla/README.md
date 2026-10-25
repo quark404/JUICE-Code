@@ -2,6 +2,8 @@
 
 将 JUICE 图文连续 Flow 扩展为 Vision–Language–Action。**A 仅表示 Action；不输入机器人 proprioceptive State，也不启用 sensor 分支。** 当前图像与未来视觉、原始指令与语言规划是不同变量组。
 
+**第一版主线：参考 OpenPI/π0.5 的 direct continuous action＋尾部padding（模型宽度32）**，不启用X-Tokenizer。原fixed与异构/codec分支保留可选，接口和7D转换边界见 [V1说明](docs/15_v1_direct_actions_and_7d.md)。
+
 默认模型：`p(A_[t:t+H) | I_t, L_inst)`。Action 直接在归一化连续坐标中做 Flow；Linear 是主干维度适配，不是 Action Tokenizer。MLP 是可选边界投影，损失仍在原始归一化动作坐标上计算，避免同时训练目标编码器导致表征坍缩。
 
 参考 Dynin-Robotics 的四项训练查询与可见/目标划分，**不复现它的离散 masked diffusion**：Dynin §3.2.1 使用均匀动作量化，本项目不分桶、不用离散 CE。Dynin §3.2.2 说明报告的训练/推理不启用 sensor；文中的 visual state 是视觉观测。

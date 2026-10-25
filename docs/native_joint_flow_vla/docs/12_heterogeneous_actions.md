@@ -77,3 +77,5 @@ native = schema.unpack(canonical[row], "one_axis")  # [H,2]，取回原生顺序
 测试覆盖不同原生维度混合加载、非尾部字段映射、无标签生成结构、逐维/时间 Mask、无效 NaN 隔离、12 类任务的反向传播和优化器更新、按样本平衡 Loss、条件动作屏蔽、采样零约束、schema 校验、固定模式回归及主干迁移。
 
 尚未验证真实混合机器人数据、GPU DDP、闭环控制或跨机器人迁移收益。布局统一只解决数值接口；动作语义转换、训练统计、坐标系/控制频率和有效字段元信息仍须由数据准备确保。
+
+第一版训练配置现使用单独的padded direct-action模式；本页的fixed默认指省略action_mode时的兼容默认值。详见 [V1说明](15_v1_direct_actions_and_7d.md)。
