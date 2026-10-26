@@ -39,74 +39,16 @@
 
 ## 1. 数据准备（Data Preparation）
 
-**目标**：以完整轨迹为单位，将同一条轨迹展开为不同条件/目标组合的训练窗口。需要计划监督的实验假设 subtask 与计划文本已标注；Action-only 不依赖这些标注。
+**目标**：按数据类型组织训练来源，逐步确定各类数据集及使用方式。主文档只保留分类，具体数据集、获取方式和接入状态在子文档中维护。
 
-### 1.1 原始数据单位：Trajectory
+| 数据分类 | 主要内容 | 用途 | 数据集子文档 |
+|---|---|---|---|
+| 通用 VQA | 通用图像问答、多模态指令 | 视觉语言理解与通用能力保持 | [通用 VQA 数据集](datasets/general_vqa.md) |
+| 具身 VQA | 机器人/室内场景中的空间、物体与任务问答 | 具身场景理解与推理 | [具身 VQA 数据集](datasets/embodied_vqa.md) |
+| 机器人轨迹 | 视觉观测、任务指令、连续动作及可选 Robot State | Action Policy、World Model、联合训练 | [机器人轨迹数据集](datasets/robot_trajectories.md) |
+| 其他辅助数据 | 图文对、视频、计划或子任务文本等 | 视觉生成、动态理解与语言规划 | [其他辅助数据集](datasets/auxiliary_data.md) |
 
-```text
-trajectory = {L_inst, I_0,[S_0], A_0, I_1,[S_1], ..., A_(T-1), I_T,[S_T], Subtasks}
-```
-
-- `I_t`：当前视觉；第一版先使用单帧，视觉特征可预计算。
-- `S_t`：可选当前机器人状态，不允许用未来状态代替。
-- `A_t`：从 t 到 t+1 的控制命令；记录字段顺序、单位、坐标系、旋转表示、absolute/delta、夹爪极性和频率。
-- `Subtasks`：任务区间、计划、目标帧和成功标记等，按具体监督任务提供。
-- `T`：动作转移数；图像原则上有 T+1 帧，有 State 的来源应按相同时间戳对齐。
-
-**时间约定**：t 是机器人轨迹时间；tau 是 Flow 去噪进度。二者不能混用。
-
-### 1.2 窗口切分与对齐
-
-| 切分单位 | 内容 | 用途 |
-|---|---|---|
-| Transition | 当前/下一观测与单步动作 | 单步世界模型、逆动力学 |
-| Action Window | `A_[t:t+H)` 与 `I_(t+H)` | Action Policy、Joint V–A |
-| Subtask Segment | 当前观测、计划与子任务终点 | Planning、Goal Prediction |
-| Whole Trajectory / Clip | 起终点或按时间排序的观测 | 目标预测、任务理解；多帧接口后续扩展 |
-
-首版先用完整窗口：`t+H <= T`；不跨 subtask 时再要求 `t+H <= subtask_end`。H 示例为16。动作维度补零不等于时间长度补齐。
-
-先按 trajectory 划分 train/val/test，再生成窗口。每条样本记录 trajectory_id、t、H、subtask_id 和目标时间点；窗口末端、下一帧和任务终点不能混称。
-
-### 1.3 统一样本接口
-
-以下为**拟定的逻辑接口**，不是当前缓存加载器可直接读取的嵌套格式：
-
-```yaml
-sample_id: traj_001/t_020/H_016/joint_lva
-trajectory_id: traj_001
-t: 20
-H: 16
-objective: joint_lva
-conditions:
-  current_image: I_20
-  instruction: L_inst
-  robot_state: S_20       # 可省略
-  state_present: true
-  state_valid_mask: valid_fields
-targets:
-  language_plan: L_plan_20
-  future_vision: I_36
-  action_chunk: A_[20:36]
-metadata:
-  action_native_dim: 7
-  future_step: 36
-  subtask_id: grasp_cup
-  normalization_id: source_train_stats
-```
-
-实际已有训练路径使用扁平 `.pt` 字典：`current_vision`、`instruction`、`instruction_mask`、`action`，按任务再提供 `future_vision`、`goal_vision`、`language_plan` 等。State 接口完成后再增加 `robot_state`、`state_present`、`state_valid_mask`。
-
-当前图像与未来图像独立编码；Instruction 与 Plan 独立编码，不能先拼接进双向 T5 再拆开，避免目标信息泄漏。归一化统计只使用训练集；缓存动作已归一化，训练时再采样噪声。
-
-### 1.4 待办与交付物
-
-- [x] 冻结特征缓存的 manifest 加载、组可用性与有效性处理。
-- [ ] 原始 trajectory/subtask schema、窗口索引与来源专属动作转换器。
-- [ ] State 字段、缺失状态标记和归一化接口。
-- [ ] 时序、跨 subtask、数据划分和坐标系检查。
-
-**交付物**：可审计的轨迹窗口缓存、来源统计和数据一致性检查。
+各类数据按其实际标签参与对应任务，不要求 VQA 或其他无动作数据提供 Action。Robot State 按来源可选。具体数据集的纳入和训练比例后续确定。
 
 ## 2. 任务定义（Task Definition）
 
