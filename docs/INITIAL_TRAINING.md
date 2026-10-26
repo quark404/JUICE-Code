@@ -2,7 +2,7 @@
 
 > **目标**：基于 JUICE 的 Joint Multimodal Flow，构建支持 **Language Planning、Future Vision、Action** 的统一生成框架，允许单目标、双目标和三目标联合去噪。
 > **阶段**：V0.4 / 总体设计与初步训练计划；不是已完成的机器人训练结果。
-> **原则**：架构支持三模态，实验分阶段推进；先验证直接连续 Action Policy，再验证联合建模收益。**Robot State 是可选条件**，不增加第四种生成目标。
+> **原则**：架构支持三模态，实验分阶段推进；按 **VL → VL＋State → VLA** 分阶段训练；进入 VLA 阶段后，先验证直接连续 Action Policy，再验证联合建模收益。**Robot State 是可选条件**，不增加第四种生成目标。
 
 ## 0. 整体方案与技术边界
 
@@ -52,7 +52,7 @@
 
 ## 2. 任务定义（Task Definition）
 
-**策略**：单目标 Baseline → 双目标 Joint → 三目标 Joint → Unified。单目标指一个带噪生成变量组，不代表条件只包含一种模态。
+**VLA 阶段内部策略**：单目标 Baseline → 双目标 Joint → 三目标 Joint → Unified。单目标指一个带噪生成变量组，不代表条件只包含一种模态。
 
 记 `C = (I_t, L_inst, [S_t])`；Task Understanding 不提供作为标签的指令条件。
 
@@ -167,9 +167,43 @@ State 条件 Token 是本项目拟定的可测试接口，不声称已证明优�
 
 **交付物**：共享三流前向、可选 State 条件接口与兼容性检查。
 
-## 6. 训练方案（Flow Training）
+## 6. 分阶段训练（Staged Training）
 
-### 6.1 默认配置与目标损失
+**目标**：先建立视觉语言能力，再对齐视觉与机器人状态，最后扩展到视觉、语言和动作的联合建模。
+
+| 阶段 | 训练内容 | 主要目标 | 数据来源 |
+|---|---|---|---|
+| 第一阶段：VL 两模态联合训练 | 视觉与语言的条件生成、联合去噪 | 建立视觉语言对齐与理解/生成基础 | 通用 VQA、具身 VQA、图文辅助数据 |
+| 第二阶段：VL＋State 对齐训练 | 在 VL 基础上接入同一时刻的 Robot State | 学习视觉观测与机器人状态的对应关系，保留原有 VL 能力 | 包含配对视觉与 State 的机器人轨迹或具身数据 |
+| 第三阶段：VLA 三模态联合训练 | 引入连续 Action，扩展条件生成与联合去噪 | 学习语言计划、未来视觉和动作之间的关联 | 含动作的机器人轨迹，按目标补充未来视觉与计划标注 |
+
+### 6.1 第一阶段：VL 两模态联合训练
+
+基于 JUICE 的 V/L 路径，训练 `V→L`、`L→V` 和 V/L 联合去噪，先建立通用及具身场景的视觉语言能力。不启用 Action 或 Robot State。VQA 用于视觉条件下的回答生成，图文对可用于反向生成或联合训练；按实际标签选择任务。
+
+**阶段产出**：可作为后续机器人训练初始化的 VL checkpoint，以及视觉语言验证结果。
+
+### 6.2 第二阶段：VL＋State，实现 V 与 State 对齐
+
+使用同一时刻的视觉观测 `I_t` 与机器人状态 `S_t`，将归一化 State 投影到主干可读取的条件空间。通过配对 V/State 的对齐目标学习二者对应关系，并保留 VL 训练目标，避免只适应状态数据而丢失视觉语言能力。
+
+State 仍是可选的干净条件，不加 Flow 噪声、不作为第四种生成目标。**仅加入 State Token 不等于已经实现对齐**；具体配对/对比损失、权重与验证方法需要单独设计和实现。对齐监督与 State 生成损失是不同概念。
+
+**阶段产出**：支持可选 State 的 VL checkpoint，以及匹配/错配 V–State 的区分或检索等对齐验证结果。当前 State 接入及对齐目标均尚未实现。
+
+### 6.3 第三阶段：VLA 三模态联合训练
+
+在前述基础上引入连续 Action：先跑通 `V＋L＋[State]→A`，再扩展到 Future Vision–Action、Language Plan–Action，最终支持 Language Plan–Future Vision–Action 联合去噪。
+
+V/L/A 目标分别采样噪声时间，通过共享 Joint Attention 交互；State 在提供时始终作为干净条件。保留 Action-only 和必要的 VL 样本，比较单目标、联合目标与任务混合的实际效果。
+
+**阶段产出**：VLA checkpoint、动作控制基线及联合生成对照结果。原生动作仍直接归一化、补齐到32维，不在本阶段默认引入 X-Tokenizer。
+
+各阶段原则上复用前一阶段的兼容权重，新增模块按结构检查后初始化；训练阶段与代码开发顺序分开记录，不将本路线视为已完成的实验。
+
+## 7. 训练方案（Flow Training）
+
+### 7.1 默认配置与目标损失
 
 当前无 State 的第一版入口：`configs/vla/action_baseline.yaml`。
 
@@ -191,25 +225,23 @@ vla_tasks: {action_policy: 1.0}
 
 第一版 Action 对32维求平均，包括 clean target 为零的 padding 通道；padding 也加噪，不能误写成有效维度 Mask loss。语言按有效内容与 EOS 监督；各目标分别记录损失和有效 token 数。State 没有生成损失。
 
-### 6.2 实验推进
+### 7.2 阶段执行与对照
 
-1. B1 无 State：验证原生动作、补齐、Flow 和反归一化链路。
-2. B1 有 State：State 接口完成后，在相同数据与预算下作对照。
-3. B2/B3：分别验证 Future Vision 和 Language Plan 的单目标训练。
-4. J1：优先比较 Action-only 与 Joint V–A；再扩展 J2/J3/J4。
-5. Unified：按标签可用性与配置权重混合任务，保留 Action-only，对比正/负迁移。
+整体训练顺序遵循第6节：VL → VL＋State → VLA。上面的 Action baseline 配置是**第三阶段的无 State 起点**，不能直接当作第一、第二阶段的运行配置。
 
-阶段是实验功能顺序，不强制每阶段 checkpoint 依次初始化。若希望同一 checkpoint 支持有/无 State，可增加条件丢弃训练，单独记录丢弃概率和两种推理结果。
+VLA 阶段内部先比较无/有 State 的 Action-only，再验证独立 Future Vision / Language Plan 基线、双目标联合和三目标联合。使用相同数据与预算进行对照，分别记录 State 接入与联合目标带来的变化。
 
-### 6.3 待办与交付物
+若希望同一 checkpoint 支持有/无 State，可增加条件丢弃训练，记录丢弃概率和两种推理结果。第二阶段若引入 V–State 对齐损失，应单独配置与监控，不混入 State 生成损失。
+
+### 7.3 待办与交付物
 
 - [x] 无 State 的三流 Flow loss、任务路由、优化器、梯度累积、EMA、日志与 checkpoint 接口。
-- [ ] State 数据、主干和采样接入及恢复兼容测试。
+- [ ] State 数据、主干和采样接入、V–State 对齐目标及恢复兼容测试。
 - [ ] 真实数据小规模训练、单目标基线与联合训练对照。
 
 **交付物**：可复现配置、训练日志与实际验证结果；不把接口测试当作训练收敛。
 
-## 7. 推理与生成（Inference & Sampling）
+## 8. 推理与生成（Inference & Sampling）
 
 - [x] Euler 多步采样；生成目标从独立高斯噪声开始，不编码真实目标动作。
 - [x] 条件保持不变；多目标在同一次前向中交互，默认同步时间网格推进。
@@ -223,14 +255,14 @@ H 是动作执行步数，默认25次 Euler 更新是去噪步数；两者不同
 
 **交付物**：统一采样接口、可选 State 输入及各任务输出检查。
 
-## 8. 评估与消融（Evaluation & Ablation）
+## 9. 评估与消融（Evaluation & Ablation）
 
 **目标**：先确认实现与数据正确，再衡量联合建模是否改善动作策略。
 
 | 类别 | 检查或指标 |
 |---|---|
 | 数据与接口 | 时序、轨迹划分、统计、原生维度、padding/截取、未来信息隔离 |
-| State 接口 | 屏蔽 State 数值变化不影响输出；有效 State 接收梯度；无 State 路径可用 |
+| State 接口与对齐 | 屏蔽 State 数值变化不影响输出；有效 State 接收梯度；无 State 路径可用；配对/错配 V–State 对照 |
 | Action | 原生有效维度上的归一化/物理误差、闭环成功率、推理耗时 |
 | Future Vision | 未来视觉 latent 误差和预测一致性 |
 | Language Plan | 可解码性、任务相关性与窗口对齐 |
@@ -243,20 +275,20 @@ H 是动作执行步数，默认25次 Euler 更新是去噪步数；两者不同
 
 **交付物**：测试结果、基线指标与有控制变量的消融记录。
 
-## 9. V0.4 开发里程碑
+## 10. V0.4 开发里程碑
 
 | 里程碑 | 内容 | 验收重点 |
 |---|---|---|
 | M1 | 数据与任务接口 | 真实来源的完整窗口、统计与标签需求可检查 |
-| M2 | 三流与可选 State | State 开关、缺失 Mask、梯度和 checkpoint 检查 |
-| M3 | Action-only | 原生动作误差、采样、反归一化与基础控制 |
-| M4 | 独立 Vision / Language 基线 | B2/B3 目标与解码/评估可独立验证 |
-| M5 | Joint V–A，随后 L–A/L–V–A | 相同预算下衡量实际收益 |
+| M2 | 第一阶段：VL 联合训练 | 视觉语言理解、生成与 checkpoint 验证 |
+| M3 | 第二阶段：VL＋State 对齐 | State 开关、缺失 Mask、梯度与配对对齐检查 |
+| M4 | 第三阶段起点：Action-only | 原生动作误差、采样、反归一化与基础控制 |
+| M5 | VLA 联合与独立目标对照 | B2/B3、Joint V–A、L–A及L–V–A的同预算比较 |
 | M6 | Unified 与消融 | 有/无 State、多任务与推理组合对照 |
 
 **下一项实现工作**：打通 State 的 Dataset → 条件投影 → Attention Mask → 推理输入 → checkpoint 与测试。
 
-## 10. 后续研究与验收边界
+## 11. 后续研究与验收边界
 
 后续再研究 State History、State Modulation/Expert、跨机器人字段语义、冻结 Action Codec、模态优先时间调度、Chunk-Causal History、Looped Refinement 或额外一致性损失。
 
